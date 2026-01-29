@@ -1,0 +1,410 @@
+"""
+Ultimate Expression-Preserving Face Pipeline
+
+Enhancements:
+- Changed AU to AU26 for jaw drop (open mouth) with moderate intensity=4 for natural open smile.
+- Set blend_region="mouth" to focus on open mouth.
+- Lowered codeformer_fidelity to 0.8 for stronger enhancement to fix blurriness while keeping identity high.
+- Kept warping and post-swap for naturalness and identity.
+- Update source_path to your new image (save as 'new_face.jpg' in test_images).
+"""
+
+import os
+import sys
+import subprocess
+import cv2
+import torch
+import numpy as np
+import gc
+from PIL import Image
+import insightface
+from insightface.app import FaceAnalysis
+from sklearn.metrics.pairwise import cosine_similarity
+from skimage.metrics import structural_similarity as ssim
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Constants - FIXED PATHS for your setup
+MAGICFACE_DIR = "/teamspace/studios/this_studio/Magicface/MagicFace"
+CODEFORMER_DIR = "/teamspace/studios/this_studio/Magicface/models/CodeFormer"
+OUTPUT_DIR = "/teamspace/studios/this_studio/Magicface/output"
+TEMP_DIR = "/teamspace/studios/this_studio/Magicface/temp"
+MODELS_DIR = "/teamspace/studios/this_studio/Magicface/models"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# AU to region mapping (based on FACS)
+AU_REGION_MAP = {
+    'AU01': 'eyes',  # Inner brow raiser
+    'AU02': 'eyes',  # Outer brow raiser
+    'AU04': 'eyes',  # Brow lowerer
+    'AU05': 'eyes',  # Upper lid raiser
+    'AU06': 'both',  # Cheek raiser
+    'AU07': 'eyes',  # Lid tightener
+    'AU09': 'mouth', # Nose wrinkler
+    'AU10': 'mouth', # Upper lip raiser
+    'AU12': 'both',  # Lip corner puller (smile)
+    'AU15': 'mouth', # Lip corner depressor
+    'AU17': 'mouth', # Chin raiser
+    'AU20': 'mouth', # Lip stretcher
+    'AU23': 'mouth', # Lip tightener
+    'AU25': 'mouth', # Lips part
+    'AU26': 'mouth', # Jaw drop - for open mouth
+}
+
+class ExpressionPreservingPipeline:
+    """Improved pipeline for expression preservation with identity focus"""
+    
+    def __init__(self, use_fp16=True):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.use_fp16 = use_fp16 and self.device == "cuda"
+        logger.info(f"Device: {self.device} | FP16: {self.use_fp16}")
+        
+        sys.path.insert(0, MAGICFACE_DIR)
+        try:
+            import compatibility
+            logger.info("✓ Compatibility module loaded")
+        except ImportError:
+            pass
+        
+        self.app = None
+        self.swapper = None
+        self._load_face_models()
+    
+    def _load_face_models(self):
+        logger.info("Loading face models...")
+        buffalo_root = "/teamspace/studios/this_studio/Magicface/Model/models"
+        self.app = FaceAnalysis(name='buffalo_l', root=buffalo_root,
+                                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        self.app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.4)
+        
+        inswapper_path = os.path.join(MODELS_DIR, "inswapper_128.onnx")
+        if os.path.exists(inswapper_path):
+            self.swapper = insightface.model_zoo.get_model(inswapper_path)
+            logger.info("✓ Inswapper loaded")
+        else:
+            logger.error(f"Inswapper not found at {inswapper_path}")
+    
+    def run_magicface(self, source_path, au_string, au_intensity):
+        """Run MagicFace with error handling"""
+        try:
+            env = os.environ.copy()
+            # Add MagicFace dir FIRST so third_party can be found
+            pythonpath = MAGICFACE_DIR
+            if "PYTHONPATH" in env:
+                pythonpath = MAGICFACE_DIR + os.pathsep + env["PYTHONPATH"]
+            env["PYTHONPATH"] = pythonpath
+            
+            logger.info("[STAGE 1] MagicFace: Preprocessing...")
+            crop_path = os.path.join(TEMP_DIR, "cropped.png")
+            subprocess.run([
+                "python", os.path.join(MAGICFACE_DIR, "utils", "preprocess.py"),
+                "--img_path", source_path,
+                "--save_path", crop_path
+            ], cwd=MAGICFACE_DIR, env=env, check=True, capture_output=True)
+            
+            logger.info("[STAGE 1] MagicFace: Retrieving background...")
+            bg_path = os.path.join(TEMP_DIR, "bg.png")
+            subprocess.run([
+                "python", os.path.join(MAGICFACE_DIR, "utils", "retrieve_bg.py"),
+                "--img_path", crop_path,
+                "--save_path", bg_path
+            ], cwd=MAGICFACE_DIR, env=env, check=True, capture_output=True)
+            
+            magic_dir = os.path.join(TEMP_DIR, "magic_out")
+            os.makedirs(magic_dir, exist_ok=True)
+            
+            logger.info("[STAGE 1] MagicFace: Generating expression...")
+            subprocess.run([
+                "python", "inference_patched.py",
+                "--img_path", crop_path,
+                "--bg_path", bg_path,
+                "--au_test", au_string,
+                "--AU_variation", au_intensity,
+                "--saved_path", magic_dir,
+                "--denoising_unet_path", os.path.join(MAGICFACE_DIR, "denoising_unet"),
+                "--ID_unet_path", os.path.join(MAGICFACE_DIR, "ID_enc")
+            ], cwd=MAGICFACE_DIR, env=env, check=True)
+            
+            logger.info("✓ MagicFace complete")
+            return crop_path, os.path.join(magic_dir, os.path.basename(crop_path))
+        except subprocess.CalledProcessError as e:
+            logger.error(f"MagicFace failed: {e}")
+            raise
+    
+    def create_expression_mask(self, image, face, region="mouth", dilation_factor=0.015):
+        """Improved mask with erosion for inner mouth/teeth area"""
+        h, w = image.shape[:2]
+        mask = np.zeros((h, w), dtype=np.float32)
+        
+        if hasattr(face, 'landmark_2d_106') and face.landmark_2d_106 is not None:
+            lm = face.landmark_2d_106.astype(np.int32)
+            
+            if region in ["mouth", "both"]:
+                mouth_pts = lm[52:72]
+                hull = cv2.convexHull(mouth_pts)
+                cv2.fillConvexPoly(mask, hull, 1.0)
+                kernel_size = int(h * dilation_factor)
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+                mask = cv2.dilate(mask, kernel)
+                # Erode to exclude inner mouth/teeth
+                erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(h * 0.01), int(h * 0.01)))
+                mask = cv2.erode(mask, erode_kernel)
+            
+            if region in ["eyes", "both"]:
+                left_eye = lm[33:43]
+                right_eye = lm[87:97]
+                for eye_pts in [left_eye, right_eye]:
+                    hull = cv2.convexHull(eye_pts)
+                    cv2.fillConvexPoly(mask, hull, 1.0)
+                kernel_size = int(h * 0.03)
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+                mask = cv2.dilate(mask, kernel)
+        else:
+            bbox = face.bbox.astype(int)
+            x1, y1, x2, y2 = bbox
+            face_h, face_w = y2 - y1, x2 - x1
+            
+            if region in ["mouth", "both"]:
+                mouth_y1 = y1 + int(face_h * 0.65)
+                mouth_y2 = y2
+                mouth_x1 = x1 + int(face_w * 0.3)
+                mouth_x2 = x2 - int(face_w * 0.3)
+                cv2.ellipse(mask, ((mouth_x1 + mouth_x2)//2, (mouth_y1 + mouth_y2)//2),
+                            (int(face_w * 0.25), int(face_h * 0.2)), 0, 0, 360, 1.0, -1)
+            
+            if region in ["eyes", "both"]:
+                eye_y1 = y1 + int(face_h * 0.2)
+                eye_y2 = y1 + int(face_h * 0.4)
+                for ex in [int(face_w * 0.25), int(face_w * 0.75)]:
+                    cv2.ellipse(mask, (x1 + ex, (eye_y1 + eye_y2)//2),
+                                (int(face_w * 0.15), int(face_h * 0.1)), 0, 0, 360, 1.0, -1)
+        
+        mask = cv2.GaussianBlur(mask, (81, 81), 50)
+        return mask
+    
+    def blend_expression(self, base_img, expr_img, base_face, expr_face, mask, strength=1.0):
+        """Blend with landmark alignment: Warp expr_img to base landmarks before blending"""
+        if base_img.shape != expr_img.shape:
+            expr_img = cv2.resize(expr_img, (base_img.shape[1], base_img.shape[0]))
+        
+        # Landmark alignment
+        if hasattr(base_face, 'landmark_2d_106') and hasattr(expr_face, 'landmark_2d_106'):
+            base_lm = base_face.landmark_2d_106
+            expr_lm = expr_face.landmark_2d_106
+            
+            key_indices = [33, 87, 55, 8]  # Left eye, right eye, nose tip, chin
+            src_pts = expr_lm[key_indices[:3]].astype(np.float32)
+            dst_pts = base_lm[key_indices[:3]].astype(np.float32)
+            
+            M = cv2.getAffineTransform(src_pts, dst_pts)
+            expr_img = cv2.warpAffine(expr_img, M, (base_img.shape[1], base_img.shape[0]), 
+                                      flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+            logger.info("Applied landmark warping for natural alignment")
+        
+        mask_3ch = np.stack([mask, mask, mask], axis=2) * strength
+        blended = base_img.astype(np.float32) * (1 - mask_3ch) + \
+                  expr_img.astype(np.float32) * mask_3ch
+        return blended.astype(np.uint8)
+    
+    def run_face_swap(self, source_path, target_img):
+        """Face swap with multi-face handling"""
+        try:
+            source_img = cv2.imread(source_path)
+            source_faces = self.app.get(source_img)
+            if not source_faces:
+                logger.warning("No face in source")
+                return target_img, 0.0
+            
+            source_face = max(source_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+            source_emb = source_face.embedding.reshape(1, -1)
+            
+            target_faces = self.app.get(target_img)
+            if not target_faces:
+                logger.warning("No face in target")
+                return target_img, 0.0
+            
+            target_face = max(target_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+            
+            result = self.swapper.get(target_img, target_face, source_face, paste_back=True)
+            
+            result_faces = self.app.get(result)
+            if result_faces:
+                result_face = max(result_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+                result_emb = result_face.embedding.reshape(1, -1)
+                similarity = cosine_similarity(source_emb, result_emb)[0][0]
+                logger.info(f"Identity similarity: {similarity*100:.2f}%")
+                return result, similarity
+            return result, 0.0
+        except Exception as e:
+            logger.error(f"Face swap failed: {e}")
+            return target_img, 0.0
+    
+    def run_codeformer(self, image, fidelity=0.8):
+        """Face enhancement using CodeFormer (higher quality than GFPGAN)"""
+        logger.info(f"[STAGE 4] CodeFormer Quality Enhancement (fidelity: {fidelity})")
+        
+        try:
+            import sys
+            codeformer_path = "/teamspace/studios/this_studio/Magicface/models/CodeFormer"
+            if codeformer_path not in sys.path:
+                sys.path.insert(0, codeformer_path)
+            
+            from basicsr.archs.codeformer_arch import CodeFormer
+            from basicsr.utils import img2tensor, tensor2img
+            from torchvision.transforms.functional import normalize
+            
+            # Load CodeFormer model
+            net = CodeFormer(dim_embd=512, codebook_size=1024, n_head=8, n_layers=9,
+                             connect_list=['32', '64', '128', '256']).to(self.device)
+            
+            ckpt_path = os.path.join(codeformer_path, "weights/CodeFormer/codeformer.pth")
+            if not os.path.exists(ckpt_path):
+                logger.error(f"✗ CodeFormer model not found at {ckpt_path}")
+                return image
+            
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            net.load_state_dict(checkpoint['params_ema'])
+            net.eval()
+            
+            # Preprocess: Resize to 512x512 for CodeFormer
+            h, w = image.shape[:2]
+            img_resized = cv2.resize(image, (512, 512), interpolation=cv2.INTER_LINEAR)
+            img = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+            img = img.astype(np.float32) / 255.0
+            face_t = torch.from_numpy(img).permute(2, 0, 1).float().to(self.device).unsqueeze(0)
+            normalize(face_t, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], inplace=True)
+            
+            # Run CodeFormer
+            with torch.no_grad():
+                output = net(face_t, w=fidelity, adain=True)[0]
+                output = output.squeeze(0).clamp(-1, 1)
+                output = (output + 1) / 2  # [-1,1] -> [0,1]
+                output = output.permute(1, 2, 0).cpu().numpy()
+                output = (output * 255).astype(np.uint8)
+                output = cv2.cvtColor(output, cv2.COLOR_RGB2BGR)
+            
+            # Resize back to original size
+            output = cv2.resize(output, (w, h), interpolation=cv2.INTER_LINEAR)
+            
+            logger.info("✓ CodeFormer enhancement complete")
+            del net
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            return output
+            
+        except Exception as e:
+            logger.warning(f"CodeFormer failed: {e}, using original image")
+            import traceback
+            traceback.print_exc()
+            return image
+    
+    def process(self, source_path, au_string="AU26", au_intensity="4", 
+                blend_region="mouth", blend_strength=0.7, use_codeformer=True,
+                codeformer_fidelity=0.8, mask_dilation_factor=0.015):
+        """
+        Ultimate main pipeline: Swap, blend (with warp), CodeFormer, FINAL SWAP.
+        The FINAL SWAP at Stage 5 restores identity after blending/enhancement!
+        """
+        logger.info("EXPRESSION-PRESERVING PIPELINE - START")
+        logger.info(f"Source: {os.path.basename(source_path)} | AU: {au_string} (intensity: {au_intensity})")
+        logger.info(f"Blend: {blend_region} (strength: {blend_strength}) | CodeFormer: {use_codeformer} (fidelity: {codeformer_fidelity})")
+        
+        try:
+            # Stage 1: MagicFace
+            cropped_path, magic_result_path = self.run_magicface(source_path, au_string, au_intensity)
+            original_img = cv2.imread(cropped_path)
+            expression_img = cv2.imread(magic_result_path)
+            
+            # Get faces for warping
+            orig_faces = self.app.get(original_img)
+            expr_faces = self.app.get(expression_img)
+            orig_face = max(orig_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1])) if orig_faces else None
+            expr_face = max(expr_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1])) if expr_faces else None
+            
+            # Stage 2: Face swap on MagicFace output (identity base)
+            logger.info("[STAGE 2] Initial Face Swap")
+            swapped, init_sim = self.run_face_swap(source_path, expression_img)
+            
+            # Stage 3: Blend expression regions with warping
+            logger.info("[STAGE 3] Expression Blending with Warping")
+            swap_faces = self.app.get(swapped)
+            if swap_faces and orig_face and expr_face:
+                swap_face = max(swap_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+                mask = self.create_expression_mask(swapped, swap_face, blend_region, dilation_factor=mask_dilation_factor)
+                blended = self.blend_expression(swapped, expression_img, swap_face, expr_face, mask, blend_strength)
+                logger.info(f"✓ Blended {blend_region} with warping")
+            else:
+                logger.warning("No face detected, using swapped as is")
+                blended = swapped
+            
+            cv2.imwrite(os.path.join(OUTPUT_DIR, "blended.png"), blended)
+            
+            enhanced = blended
+            # Stage 4: CodeFormer
+            if use_codeformer:
+                enhanced = self.run_codeformer(blended, fidelity=codeformer_fidelity)
+            
+            # *** CRITICAL: Stage 5 - Post-Enhancement Face Swap (RESTORES IDENTITY!) ***
+            logger.info("[STAGE 5] Post-Enhancement Face Swap (Restoring Identity)")
+            final_result, final_sim = self.run_face_swap(source_path, enhanced)
+            
+            # Stage 6: Verification
+            logger.info("[STAGE 6] Final Verification")
+            source_img = cv2.imread(source_path)
+            source_faces = self.app.get(source_img)
+            result_faces = self.app.get(final_result)
+            
+            final_similarity = 0.0
+            quality_ssim = 0.0
+            if source_faces and result_faces:
+                src_face = max(source_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+                res_face = max(result_faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+                src_emb = src_face.embedding.reshape(1, -1)
+                res_emb = res_face.embedding.reshape(1, -1)
+                final_similarity = cosine_similarity(src_emb, res_emb)[0][0]
+                
+                src_gray = cv2.cvtColor(source_img, cv2.COLOR_BGR2GRAY)
+                res_gray = cv2.cvtColor(final_result, cv2.COLOR_BGR2GRAY)
+                quality_ssim = ssim(src_gray, res_gray, data_range=res_gray.max() - res_gray.min())
+            
+            logger.info(f"Final identity: {final_similarity*100:.2f}% | SSIM: {quality_ssim:.4f}")
+            
+            final_path = os.path.join(OUTPUT_DIR, "final_result.png")
+            cv2.imwrite(final_path, final_result)
+            
+            logger.info("PIPELINE COMPLETE")
+            return final_path, final_similarity, quality_ssim
+        
+        except Exception as e:
+            logger.error(f"Pipeline failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, 0.0, 0.0
+
+
+if __name__ == "__main__":
+    pipeline = ExpressionPreservingPipeline(use_fp16=True)
+    
+    # UPDATE THIS to your image path
+    source = "/teamspace/studios/this_studio/Magicface/MagicFace/test_images/ros1.jpg"
+    
+    final_output, similarity, quality = pipeline.process(
+        source_path=source,
+        au_string="AU12",            # Smile
+        au_intensity="4",            # Moderate
+        blend_region="mouth",        # Focus on mouth
+        blend_strength=0.7,          # For expression
+        use_codeformer=True,
+        codeformer_fidelity=0.1,     # LOWER = STRONGER enhancement (was 0.8)
+        mask_dilation_factor=0.015,  # Tighter mask
+    )
+    
+    if final_output:
+        logger.info(f"✓ Final output: {final_output} | Identity: {similarity*100:.2f}% | SSIM: {quality:.4f}")

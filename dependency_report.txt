@@ -1,0 +1,9 @@
+MagicFace + DECA Dependency Report
+========================================
+
+Python: 3.10.19
+CUDA: CUDA 11.8 - Tesla T4
+
+OK: 15
+Missing: ['face_alignment', 'chumpy', 'yacs', 'kornia']
+Version Mismatch: []
